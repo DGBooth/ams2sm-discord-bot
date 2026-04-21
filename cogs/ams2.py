@@ -6,29 +6,45 @@ import os
 import datetime
 
 
-def _format_time_ms(ms: int | float | None) -> str:
-    """Convert milliseconds to M:SS.mmm string."""
-    if ms is None or ms <= 0:
+def _ns_to_ms(ns: int | float) -> int:
+    return int(ns) // 1_000_000
+
+
+def _format_ms(ms: int | None, sign: bool = False) -> str:
+    """Format milliseconds as [+]M:SS.mmm or SS.mmm."""
+    if ms is None or ms < 0:
         return "—"
-    ms = int(ms)
-    minutes, remainder = divmod(ms, 60000)
-    seconds, millis = divmod(remainder, 1000)
+    prefix = "+" if sign else ""
+    minutes, remainder = divmod(ms, 60_000)
+    seconds, millis = divmod(remainder, 1_000)
     if minutes:
-        return f"{minutes}:{seconds:02d}.{millis:03d}"
-    return f"{seconds}.{millis:03d}"
-
-
-def _driver_name(member: dict) -> str:
-    driver = member.get("driver") or member.get("Driver") or {}
-    if isinstance(driver, dict):
-        name = driver.get("name") or driver.get("Name") or ""
-    else:
-        name = str(driver)
-    return name or member.get("name") or member.get("Name") or "Unknown"
+        return f"{prefix}{minutes}:{seconds:02d}.{millis:03d}"
+    return f"{prefix}{seconds}.{millis:03d}"
 
 
 def _position_emoji(pos: int) -> str:
-    return {1: "🥇", 2: "🥈", 3: "🥉"}.get(pos, f"`{pos:>2}`")
+    return {1: "🥇", 2: "🥈", 3: "🥉"}.get(pos, f"`P{pos}`")
+
+
+def _driver_name(place: dict) -> str:
+    drivers = place.get("Drivers") or []
+    if drivers:
+        return drivers[0].get("Name") or "Unknown"
+    # Fallback: first lap entry has DriverName
+    laps = place.get("Laps") or []
+    if laps:
+        return laps[0].get("DriverName") or "Unknown"
+    return "Unknown"
+
+
+def _fastest_valid_lap_ms(place: dict) -> int | None:
+    best = None
+    for lap in place.get("Laps") or []:
+        if lap.get("Valid") and lap.get("Time", 0) > 0:
+            ms = _ns_to_ms(lap["Time"])
+            if best is None or ms < best:
+                best = ms
+    return best
 
 
 class AMS2Cog(commands.Cog):
@@ -38,42 +54,38 @@ class AMS2Cog(commands.Cog):
 
     # ── /results ──────────────────────────────────────────────────────────────
 
-    @app_commands.command(name="results", description="Show the most recent race result")
-    @app_commands.describe(count="Number of recent results to list (default 1, max 5)")
+    @app_commands.command(name="results", description="Show the most recent race result(s)")
+    @app_commands.describe(count="Number of recent races to show (default 1, max 5)")
     async def results(self, interaction: discord.Interaction, count: int = 1):
         await interaction.response.defer()
         count = max(1, min(count, 5))
 
         try:
-            listing = await self.client.list_results(page=1)
+            entries = await self.client.list_race_results(count=count)
         except Exception as e:
-            await interaction.followup.send(f"Failed to fetch results: {e}")
+            await interaction.followup.send(f"Failed to fetch results list: {e}")
             return
 
-        entries = listing.get("results", [])
         if not entries:
-            await interaction.followup.send("No results found on the server.")
+            await interaction.followup.send("No race results found.")
             return
 
         embeds = []
-        for entry in entries[:count]:
-            url = (
-                entry.get("results_json_url")
-                or entry.get("url")
-                or entry.get("ResultFile")
-                or entry.get("File")
-                or ""
-            )
+        for entry in entries:
+            url = entry.get("server_manager_results_json_url") or ""
+            if not url:
+                continue
             try:
                 result = await self.client.get_result(url)
             except Exception as e:
                 await interaction.followup.send(f"Failed to fetch result detail: {e}")
                 return
+            embeds.append(_build_result_embed(entry, result))
 
-            embed = _build_result_embed(entry, result)
-            embeds.append(embed)
-
-        await interaction.followup.send(embeds=embeds)
+        if embeds:
+            await interaction.followup.send(embeds=embeds)
+        else:
+            await interaction.followup.send("No results could be loaded.")
 
     # ── /standings ────────────────────────────────────────────────────────────
 
@@ -92,7 +104,7 @@ class AMS2Cog(commands.Cog):
 
     # ── /championships ────────────────────────────────────────────────────────
 
-    @app_commands.command(name="championships", description="List available championships")
+    @app_commands.command(name="championships", description="List available championships and their IDs")
     async def championships(self, interaction: discord.Interaction):
         await interaction.response.defer()
         try:
@@ -109,11 +121,11 @@ class AMS2Cog(commands.Cog):
         for c in champs:
             cid = c.get("id") or c.get("ID") or c.get("championshipId") or "?"
             name = c.get("name") or c.get("Name") or c.get("title") or "Unnamed"
-            lines.append(f"**{name}** — ID: `{cid}`")
+            lines.append(f"**{name}**\n`{cid}`")
 
         embed = discord.Embed(
             title="Championships",
-            description="\n".join(lines),
+            description="\n\n".join(lines),
             colour=discord.Colour.blue(),
         )
         await interaction.followup.send(embed=embed)
@@ -138,121 +150,137 @@ class AMS2Cog(commands.Cog):
 # ── Embed builders ─────────────────────────────────────────────────────────────
 
 def _build_result_embed(entry: dict, result: dict) -> discord.Embed:
-    # Try to pull track/session info from both the listing entry and the result body
-    track = (
-        entry.get("track") or entry.get("Track")
-        or result.get("TrackVariation") or result.get("track")
-        or result.get("trackName") or result.get("track_name") or "Unknown Track"
-    )
-    session_type = (
-        entry.get("sessionType") or entry.get("session_type") or entry.get("SessionType")
-        or result.get("sessionType") or result.get("session_type") or result.get("SessionType")
-        or "Race"
-    )
-    raw_date = (
-        entry.get("date") or entry.get("Date")
-        or result.get("startTime") or result.get("start_time") or result.get("StartTime") or ""
-    )
+    raw_date = entry.get("date") or result.get("Date") or ""
     try:
         dt = datetime.datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
-        date_str = dt.strftime("%d %b %Y  %H:%M UTC")
+        date_str = dt.strftime("%d %b %Y")
     except Exception:
-        date_str = raw_date or "Unknown date"
+        date_str = raw_date
 
-    embed = discord.Embed(
-        title=f"{session_type} — {track}",
-        description=date_str,
-        colour=discord.Colour.gold(),
-    )
+    places: list[dict] = result.get("Places") or []
+    places = sorted(places, key=lambda p: p.get("Position", 99))
 
-    # Normalise participant list across known formats
-    participants = (
-        result.get("Result", {}).get("Members")
-        or result.get("participants")
-        or result.get("Participants")
-        or result.get("members")
-        or []
-    )
+    # Determine race class (all finishers are usually the same class)
+    race_class = places[0].get("Class", "") if places else ""
+    lap_counts = [len(p.get("Laps") or []) for p in places]
+    leader_laps = max(lap_counts) if lap_counts else 0
 
-    # Sort by finishing position
-    def _finish_pos(p):
-        return (
-            p.get("RacePosition") or p.get("racePosition")
-            or p.get("finishingPosition") or p.get("position")
-            or p.get("Position") or 99
-        )
+    title = f"Race Result — {date_str}"
+    if race_class:
+        title += f"  |  {race_class}"
 
-    participants = sorted(participants, key=_finish_pos)
+    embed = discord.Embed(title=title, colour=discord.Colour.gold())
 
+    # Leader's total time for gap calculations
+    leader_ms: int | None = None
+    if places:
+        raw = places[0].get("TotalRaceTime")
+        if raw:
+            leader_ms = _ns_to_ms(raw)
+
+    # --- Finishers ---
     lines = []
-    fastest_lap = None
-    fastest_driver = None
+    overall_fastest_ms: int | None = None
+    overall_fastest_driver = ""
 
-    for p in participants[:20]:
-        pos = _finish_pos(p)
+    for p in places:
+        pos = p.get("Position", 99)
         name = _driver_name(p)
-        car = p.get("carName") or p.get("CarName") or p.get("vehicleName") or ""
-        total_ms = (
-            p.get("TotalTime") or p.get("totalTime")
-            or p.get("raceTime") or p.get("RaceTime")
-        )
-        fl_ms = p.get("FastestLapTime") or p.get("fastestLapTime") or p.get("fastestLap")
+        car = p.get("CarModel") or ""
+        laps = len(p.get("Laps") or [])
+        dsq = p.get("Disqualified", False)
+        total_ns = p.get("TotalRaceTime")
+        total_ms = _ns_to_ms(total_ns) if total_ns else None
+        penalty_ns = p.get("TimePenalty") or 0
+        penalty_ms = _ns_to_ms(penalty_ns) if penalty_ns > 0 else 0
 
-        if fl_ms and (fastest_lap is None or fl_ms < fastest_lap):
-            fastest_lap = fl_ms
-            fastest_driver = name
+        fl_ms = _fastest_valid_lap_ms(p)
+        if fl_ms and (overall_fastest_ms is None or fl_ms < overall_fastest_ms):
+            overall_fastest_ms = fl_ms
+            overall_fastest_driver = name
 
-        time_str = _format_time_ms(total_ms)
-        car_str = f" ({car})" if car else ""
-        lines.append(f"{_position_emoji(pos)} {name}{car_str} — {time_str}")
+        pos_str = _position_emoji(pos)
+        car_str = f" *({car})*" if car else ""
+        dsq_str = " ~~DSQ~~" if dsq else ""
+
+        if dsq:
+            time_str = "DSQ"
+        elif laps < leader_laps:
+            laps_down = leader_laps - laps
+            lap_word = "lap" if laps_down == 1 else "laps"
+            time_str = f"+{laps_down} {lap_word}"
+        elif leader_ms is not None and total_ms is not None and pos > 1:
+            gap = total_ms - leader_ms
+            time_str = _format_ms(gap, sign=True)
+        else:
+            time_str = _format_ms(total_ms)
+
+        if penalty_ms:
+            time_str += f" (pen +{_format_ms(penalty_ms)})"
+
+        lines.append(f"{pos_str} **{name}**{car_str}{dsq_str} — {time_str}")
 
     if lines:
-        embed.add_field(name="Finishers", value="\n".join(lines), inline=False)
+        embed.add_field(name=f"Results  ({leader_laps} laps)", value="\n".join(lines), inline=False)
+    else:
+        embed.description = "No finishers recorded."
 
-    if fastest_driver:
-        embed.set_footer(text=f"Fastest lap: {fastest_driver}  {_format_time_ms(fastest_lap)}")
+    footer_parts = []
+    if overall_fastest_driver:
+        footer_parts.append(f"Fastest lap: {overall_fastest_driver}  {_format_ms(overall_fastest_ms)}")
+
+    champ_id = result.get("ChampionshipID") or ""
+    if champ_id:
+        footer_parts.append(f"Championship: {champ_id}")
+
+    if footer_parts:
+        embed.set_footer(text="  •  ".join(footer_parts))
 
     return embed
 
 
 def _build_standings_embed(championship_id: str, data: dict) -> discord.Embed:
-    name = data.get("name") or data.get("Name") or data.get("championshipName") or championship_id
+    name = (
+        data.get("name") or data.get("Name")
+        or data.get("championshipName") or f"Championship `{championship_id}`"
+    )
     embed = discord.Embed(
-        title=f"Championship Standings — {name}",
+        title=f"Standings — {name}",
         colour=discord.Colour.blue(),
     )
 
-    # Driver standings
-    drivers = data.get("drivers") or data.get("Drivers") or data.get("driverStandings") or []
+    drivers: list[dict] = data.get("drivers") or data.get("Drivers") or data.get("driverStandings") or []
 
-    def _standing_pos(d):
-        return (
-            d.get("position") or d.get("Position")
-            or d.get("classPosition") or 99
-        )
+    def _pos(d: dict) -> int:
+        return d.get("position") or d.get("Position") or d.get("classPosition") or 99
 
-    drivers = sorted(drivers, key=_standing_pos)
+    def _pts(d: dict) -> int | float:
+        return d.get("points") or d.get("Points") or 0
+
+    def _name(d: dict) -> str:
+        driver = d.get("driver") or d.get("Driver") or {}
+        if isinstance(driver, dict):
+            n = driver.get("name") or driver.get("Name") or ""
+        else:
+            n = str(driver)
+        return n or d.get("name") or d.get("Name") or "Unknown"
 
     lines = []
-    for d in drivers[:25]:
-        pos = _standing_pos(d)
-        driver_name = _driver_name(d)
-        pts = d.get("points") or d.get("Points") or 0
-        lines.append(f"{_position_emoji(pos)} **{driver_name}** — {pts} pts")
+    for d in sorted(drivers, key=_pos)[:25]:
+        lines.append(f"{_position_emoji(_pos(d))} **{_name(d)}** — {_pts(d)} pts")
 
     if lines:
         embed.add_field(name="Drivers", value="\n".join(lines), inline=False)
     else:
         embed.description = "No standings data available yet."
 
-    # Team standings (optional)
-    teams = data.get("teams") or data.get("Teams") or data.get("teamStandings") or []
+    teams: list[dict] = data.get("teams") or data.get("Teams") or data.get("teamStandings") or []
     if teams:
         team_lines = []
-        for i, t in enumerate(sorted(teams, key=_standing_pos)[:10], 1):
+        for i, t in enumerate(sorted(teams, key=_pos)[:10], 1):
             tname = t.get("name") or t.get("Name") or t.get("team") or "Unknown"
             pts = t.get("points") or t.get("Points") or 0
-            team_lines.append(f"`{i:>2}` {tname} — {pts} pts")
+            team_lines.append(f"`{i:>2}.` {tname} — {pts} pts")
         embed.add_field(name="Teams", value="\n".join(team_lines), inline=False)
 
     return embed
