@@ -1,5 +1,6 @@
 import aiohttp
 from typing import Optional
+from api.tracks import TRACK_NAMES as _STATIC_TRACK_NAMES
 
 
 class AMS2Client:
@@ -96,7 +97,8 @@ class AMS2Client:
         return mapping
 
     def resolve_track(self, track_id: str) -> str:
-        return self._track_names.get(str(track_id), f"Track `{track_id}`")
+        tid = str(track_id)
+        return self._track_names.get(tid) or _STATIC_TRACK_NAMES.get(tid) or f"Track `{tid}`"
 
     async def session_status(self, members: bool = True, participants: bool = True) -> dict:
         params = {}
