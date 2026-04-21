@@ -1,5 +1,4 @@
 import aiohttp
-import os
 from typing import Optional
 
 
@@ -27,40 +26,39 @@ class AMS2Client:
     async def healthcheck(self) -> dict:
         return await self._get("/healthcheck.json")
 
-    async def list_results(self, page: int = 1, search: str = None) -> dict:
+    async def list_results(self, page: int = 0, search: str = None) -> dict:
+        """List results. Page is 0-indexed."""
         params = {"page": page}
         if search:
             params["q"] = search
         return await self._get("/api/results/list.json", params=params)
 
     async def get_result(self, url: str) -> dict:
-        # Accept either a full path or bare filename
-        if url.startswith("/") or url.startswith("http"):
-            path = url if url.startswith("/") else url.split(self.base_url, 1)[-1]
-        else:
-            path = f"/api/results/{url}"
+        """Fetch a result file by its server_manager_results_json_url path."""
+        path = url if url.startswith("/") else f"/server/0/result/download/{url}"
         return await self._get(path)
 
-    def _result_url(self, entry: dict) -> Optional[str]:
-        return (
-            entry.get("results_json_url")
-            or entry.get("url")
-            or entry.get("ResultFile")
-            or entry.get("File")
-        )
-
-    async def get_latest_result(self) -> Optional[dict]:
-        listing = await self.list_results(page=1)
-        results = listing.get("results", [])
-        if not results:
-            return None
-        first = results[0]
-        url = self._result_url(first)
-        if not url:
-            return None
-        data = await self.get_result(url)
-        data["_meta"] = first
-        return data
+    async def list_race_results(self, count: int = 1) -> list[dict]:
+        """
+        Return up to `count` Race-session entries from the results listing,
+        searching across pages as needed.
+        """
+        found = []
+        page = 0
+        while len(found) < count:
+            listing = await self.list_results(page=page)
+            entries = listing.get("results", [])
+            if not entries:
+                break
+            for entry in entries:
+                if entry.get("manager_session_type", "").lower() == "race":
+                    found.append(entry)
+                    if len(found) == count:
+                        break
+            if page >= listing.get("num_pages", 1) - 1:
+                break
+            page += 1
+        return found
 
     async def get_championship_standings(self, championship_id: str) -> dict:
         return await self._get(f"/api/championship/{championship_id}/standings.json")
