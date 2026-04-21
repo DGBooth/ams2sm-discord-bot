@@ -300,43 +300,53 @@ def _build_session_embed(client: AMS2Client, data: dict) -> discord.Embed:
 
 
 def _build_standings_embed(championship_id: str, data: dict) -> discord.Embed:
-    name = (
-        data.get("name") or data.get("Name")
-        or data.get("championshipName") or f"Championship `{championship_id}`"
+    embed = discord.Embed(
+        title=f"Championship Standings",
+        colour=discord.Colour.blue(),
     )
-    embed = discord.Embed(title=f"Standings — {name}", colour=discord.Colour.blue())
 
-    drivers: list[dict] = data.get("drivers") or data.get("Drivers") or data.get("driverStandings") or []
+    # DriverStandings is a dict keyed by class name (empty string = default)
+    driver_standings: dict = data.get("DriverStandings") or {}
 
-    def _pos(d: dict) -> int:
-        return d.get("position") or d.get("Position") or d.get("classPosition") or 99
+    for class_name, drivers in driver_standings.items():
+        if not drivers:
+            continue
 
-    def _pts(d: dict) -> int | float:
-        return d.get("points") or d.get("Points") or 0
+        # Filter out AI/non-players and sort by position
+        drivers = [d for d in drivers if d.get("IsPlayer", True)]
+        drivers = sorted(drivers, key=lambda d: d.get("Position", 99))
 
-    def _name(d: dict) -> str:
-        driver = d.get("driver") or d.get("Driver") or {}
-        if isinstance(driver, dict):
-            n = driver.get("name") or driver.get("Name") or ""
-        else:
-            n = str(driver)
-        return n or d.get("name") or d.get("Name") or "Unknown"
+        lines = []
+        for d in drivers[:25]:
+            pos = d.get("Position", 99)
+            name = d.get("DriverName") or "Unknown"
+            pts = d.get("Points", 0)
+            penalty = d.get("PointsPenalty", 0)
+            pts_str = str(pts)
+            if penalty:
+                pts_str += f" (-{penalty})"
+            lines.append(f"{_position_emoji(pos)} **{name}** — {pts_str} pts")
 
-    lines = [f"{_position_emoji(_pos(d))} **{_name(d)}** — {_pts(d)} pts"
-             for d in sorted(drivers, key=_pos)[:25]]
+        field_name = f"Drivers — {class_name}" if class_name else "Drivers"
+        embed.add_field(name=field_name, value="\n".join(lines), inline=False)
 
-    if lines:
-        embed.add_field(name="Drivers", value="\n".join(lines), inline=False)
-    else:
+    if not embed.fields:
         embed.description = "No standings data available yet."
 
-    teams: list[dict] = data.get("teams") or data.get("Teams") or data.get("teamStandings") or []
-    if teams:
-        team_lines = [
-            f"`{i:>2}.` {t.get('name') or t.get('Name') or 'Unknown'} — {t.get('points') or t.get('Points') or 0} pts"
-            for i, t in enumerate(sorted(teams, key=_pos)[:10], 1)
-        ]
-        embed.add_field(name="Teams", value="\n".join(team_lines), inline=False)
+    # TeamStandings is also a dict keyed by class; values may be null
+    team_standings: dict = data.get("TeamStandings") or {}
+    for class_name, teams in team_standings.items():
+        if not teams:
+            continue
+        teams = sorted(teams, key=lambda t: t.get("Position", 99))
+        team_lines = []
+        for t in teams[:10]:
+            pos = t.get("Position", 99)
+            tname = t.get("TeamName") or t.get("name") or "Unknown"
+            pts = t.get("Points", 0)
+            team_lines.append(f"{_position_emoji(pos)} {tname} — {pts} pts")
+        field_name = f"Teams — {class_name}" if class_name else "Teams"
+        embed.add_field(name=field_name, value="\n".join(team_lines), inline=False)
 
     return embed
 
