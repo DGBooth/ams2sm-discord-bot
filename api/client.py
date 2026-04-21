@@ -3,9 +3,9 @@ from typing import Optional
 
 
 class AMS2Client:
-    def __init__(self, base_url: str, server_id: int = 0):
+    def __init__(self, base_url: str, game_server_url: str | None = None):
         self.base_url = base_url.rstrip("/")
-        self.server_id = server_id
+        self.game_server_url = game_server_url.rstrip("/") if game_server_url else None
         self._session: Optional[aiohttp.ClientSession] = None
         self._track_names: dict[str, str] = {}
 
@@ -18,33 +18,39 @@ class AMS2Client:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def _get(self, path: str, params: dict = None) -> dict | list:
+    async def _get(self, base: str, path: str, params: dict = None) -> dict | list:
         session = await self._get_session()
-        url = f"{self.base_url}{path}"
+        url = f"{base}{path}"
         async with session.get(url, params=params) as resp:
             resp.raise_for_status()
             return await resp.json(content_type=None)
 
-    def _server(self, path: str) -> str:
-        """Prefix a path with the per-server proxy path."""
-        return f"/server/{self.server_id}{path}"
+    def _sm(self, path: str, params: dict = None):
+        """GET from the Server Manager."""
+        return self._get(self.base_url, path, params)
+
+    def _gs(self, path: str, params: dict = None):
+        """GET from the AMS2 game server's built-in API. Raises if not configured."""
+        if not self.game_server_url:
+            raise RuntimeError("AMS2_GAME_SERVER_URL is not configured")
+        return self._get(self.game_server_url, path, params)
 
     # ── Server Manager endpoints ───────────────────────────────────────────────
 
     async def healthcheck(self) -> dict:
-        return await self._get("/healthcheck.json")
+        return await self._sm("/healthcheck.json")
 
     async def list_results(self, page: int = 0, search: str = None) -> dict:
         """List results. Page is 0-indexed."""
         params = {"page": page}
         if search:
             params["q"] = search
-        return await self._get("/api/results/list.json", params=params)
+        return await self._sm("/api/results/list.json", params)
 
     async def get_result(self, url: str) -> dict:
         """Fetch a result file by its server_manager_results_json_url path."""
-        path = url if url.startswith("/") else self._server(f"/result/download/{url}")
-        return await self._get(path)
+        path = url if url.startswith("/") else f"/server/0/result/download/{url}"
+        return await self._sm(path)
 
     async def list_race_results(self, count: int = 1) -> list[dict]:
         """Return up to `count` Race-session entries, searching across pages."""
@@ -66,19 +72,19 @@ class AMS2Client:
         return found
 
     async def get_championship_standings(self, championship_id: str) -> dict:
-        return await self._get(f"/api/championship/{championship_id}/standings.json")
+        return await self._sm(f"/api/championship/{championship_id}/standings.json")
 
     async def list_championships(self) -> list:
-        data = await self._get("/api/championships")
+        data = await self._sm("/api/championships")
         if isinstance(data, list):
             return data
         return data.get("championships", [])
 
-    # ── AMS2 game server endpoints (proxied via /server/{id}/) ────────────────
+    # ── AMS2 game server endpoints ─────────────────────────────────────────────
 
     async def fetch_track_names(self) -> dict[str, str]:
-        """Fetch the track list and cache id→name. Returns the mapping."""
-        data = await self._get(self._server("/api/list/tracks"))
+        """Fetch track list from the game server and cache id→name."""
+        data = await self._gs("/api/list/tracks")
         tracks = data if isinstance(data, list) else data.get("list", [])
         mapping: dict[str, str] = {}
         for t in tracks:
@@ -98,4 +104,4 @@ class AMS2Client:
             params["members"] = "true"
         if participants:
             params["participants"] = "true"
-        return await self._get(self._server("/api/session/status"), params=params)
+        return await self._gs("/api/session/status", params)

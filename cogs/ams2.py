@@ -52,11 +52,14 @@ class AMS2Cog(commands.Cog):
         self.client = client
 
     async def cog_load(self):
-        try:
-            await self.client.fetch_track_names()
-            print(f"Loaded {len(self.client._track_names)} track names")
-        except Exception as e:
-            print(f"Warning: could not load track names: {e}")
+        if self.client.game_server_url:
+            try:
+                await self.client.fetch_track_names()
+                print(f"Loaded {len(self.client._track_names)} track names")
+            except Exception as e:
+                print(f"Warning: could not load track names: {e}")
+        else:
+            print("AMS2_GAME_SERVER_URL not set — track names and /session unavailable")
 
     # ── /results ──────────────────────────────────────────────────────────────
 
@@ -97,11 +100,17 @@ class AMS2Cog(commands.Cog):
 
     @app_commands.command(name="session", description="Show the current live server session")
     async def session(self, interaction: discord.Interaction):
+        if not self.client.game_server_url:
+            await interaction.response.send_message(
+                "Live session info is not available — `AMS2_GAME_SERVER_URL` is not configured.",
+                ephemeral=True,
+            )
+            return
         await interaction.response.defer()
         try:
             data = await self.client.session_status(members=True, participants=True)
         except Exception as e:
-            await interaction.followup.send(f"Could not reach server: {e}")
+            await interaction.followup.send(f"Could not reach game server: {e}")
             return
 
         embed = _build_session_embed(self.client, data)
@@ -334,5 +343,6 @@ def _build_standings_embed(championship_id: str, data: dict) -> discord.Embed:
 
 async def setup(bot: commands.Bot):
     base_url = os.environ["AMS2SM_BASE_URL"]
-    client = AMS2Client(base_url)
+    game_server_url = os.environ.get("AMS2_GAME_SERVER_URL") or None
+    client = AMS2Client(base_url, game_server_url=game_server_url)
     await bot.add_cog(AMS2Cog(bot, client))
