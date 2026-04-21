@@ -118,10 +118,31 @@ class AMS2Cog(commands.Cog):
 
     # ── /standings ────────────────────────────────────────────────────────────
 
-    @app_commands.command(name="standings", description="Show championship standings")
-    @app_commands.describe(championship_id="Championship ID (use /championships to find IDs)")
-    async def standings(self, interaction: discord.Interaction, championship_id: str):
+    @app_commands.command(name="standings", description="Show championship standings from the most recent race")
+    async def standings(self, interaction: discord.Interaction):
         await interaction.response.defer()
+
+        try:
+            entries = await self.client.list_race_results(count=1)
+        except Exception as e:
+            await interaction.followup.send(f"Failed to fetch results: {e}")
+            return
+
+        if not entries:
+            await interaction.followup.send("No race results found.")
+            return
+
+        try:
+            result = await self.client.get_result(entries[0]["server_manager_results_json_url"])
+        except Exception as e:
+            await interaction.followup.send(f"Failed to fetch result detail: {e}")
+            return
+
+        championship_id = result.get("ChampionshipID")
+        if not championship_id:
+            await interaction.followup.send("The most recent race is not part of a championship.")
+            return
+
         try:
             data = await self.client.get_championship_standings(championship_id)
         except Exception as e:
