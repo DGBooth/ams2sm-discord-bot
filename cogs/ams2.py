@@ -5,6 +5,12 @@ from api.client import AMS2Client
 import os
 import datetime
 
+# Maps AMS2 track hash IDs to human-readable names.
+# Add entries here as new tracks are encountered.
+TRACK_NAMES: dict[str, str] = {
+    "-1976262540": "Circuit de Barcelona-Catalunya 1991",
+}
+
 
 def _ns_to_ms(ns: int | float) -> int:
     return int(ns) // 1_000_000
@@ -165,7 +171,10 @@ def _build_result_embed(entry: dict, result: dict) -> discord.Embed:
     lap_counts = [len(p.get("Laps") or []) for p in places]
     leader_laps = max(lap_counts) if lap_counts else 0
 
-    title = f"Race Result — {date_str}"
+    track_id = str(result.get("TrackID") or entry.get("track") or "")
+    track_name = TRACK_NAMES.get(track_id, f"Track `{track_id}`" if track_id else "Unknown Track")
+
+    title = f"Race Result — {track_name}  |  {date_str}"
     if race_class:
         title += f"  |  {race_class}"
 
