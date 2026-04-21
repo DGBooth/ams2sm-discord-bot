@@ -5,12 +5,6 @@ from api.client import AMS2Client
 import os
 import datetime
 
-# Maps AMS2 track hash IDs to human-readable names.
-# Add entries here as new tracks are encountered.
-TRACK_NAMES: dict[str, str] = {
-    "-1976262540": "Circuit de Barcelona-Catalunya 1991",
-}
-
 
 def _ns_to_ms(ns: int | float) -> int:
     return int(ns) // 1_000_000
@@ -36,7 +30,6 @@ def _driver_name(place: dict) -> str:
     drivers = place.get("Drivers") or []
     if drivers:
         return drivers[0].get("Name") or "Unknown"
-    # Fallback: first lap entry has DriverName
     laps = place.get("Laps") or []
     if laps:
         return laps[0].get("DriverName") or "Unknown"
@@ -57,6 +50,16 @@ class AMS2Cog(commands.Cog):
     def __init__(self, bot: commands.Bot, client: AMS2Client):
         self.bot = bot
         self.client = client
+
+    async def cog_load(self):
+        if self.client.game_server_url:
+            try:
+                await self.client.fetch_track_names()
+                print(f"Loaded {len(self.client._track_names)} track names")
+            except Exception as e:
+                print(f"Warning: could not load track names: {e}")
+        else:
+            print("AMS2_GAME_SERVER_URL not set — track names and /session unavailable")
 
     # ── /results ──────────────────────────────────────────────────────────────
 
@@ -86,12 +89,32 @@ class AMS2Cog(commands.Cog):
             except Exception as e:
                 await interaction.followup.send(f"Failed to fetch result detail: {e}")
                 return
-            embeds.append(_build_result_embed(entry, result))
+            embeds.append(_build_result_embed(self.client, entry, result))
 
         if embeds:
             await interaction.followup.send(embeds=embeds)
         else:
             await interaction.followup.send("No results could be loaded.")
+
+    # ── /session ──────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="session", description="Show the current live server session")
+    async def session(self, interaction: discord.Interaction):
+        if not self.client.game_server_url:
+            await interaction.response.send_message(
+                "Live session info is not available — `AMS2_GAME_SERVER_URL` is not configured.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer()
+        try:
+            data = await self.client.session_status(members=True, participants=True)
+        except Exception as e:
+            await interaction.followup.send(f"Could not reach game server: {e}")
+            return
+
+        embed = _build_session_embed(self.client, data)
+        await interaction.followup.send(embed=embed)
 
     # ── /standings ────────────────────────────────────────────────────────────
 
@@ -155,7 +178,7 @@ class AMS2Cog(commands.Cog):
 
 # ── Embed builders ─────────────────────────────────────────────────────────────
 
-def _build_result_embed(entry: dict, result: dict) -> discord.Embed:
+def _build_result_embed(client: AMS2Client, entry: dict, result: dict) -> discord.Embed:
     raw_date = entry.get("date") or result.get("Date") or ""
     try:
         dt = datetime.datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
@@ -166,13 +189,12 @@ def _build_result_embed(entry: dict, result: dict) -> discord.Embed:
     places: list[dict] = result.get("Places") or []
     places = sorted(places, key=lambda p: p.get("Position", 99))
 
-    # Determine race class (all finishers are usually the same class)
     race_class = places[0].get("Class", "") if places else ""
     lap_counts = [len(p.get("Laps") or []) for p in places]
     leader_laps = max(lap_counts) if lap_counts else 0
 
     track_id = str(result.get("TrackID") or entry.get("track") or "")
-    track_name = TRACK_NAMES.get(track_id, f"Track `{track_id}`" if track_id else "Unknown Track")
+    track_name = client.resolve_track(track_id) if track_id else "Unknown Track"
 
     title = f"Race Result — {track_name}  |  {date_str}"
     if race_class:
@@ -180,14 +202,12 @@ def _build_result_embed(entry: dict, result: dict) -> discord.Embed:
 
     embed = discord.Embed(title=title, colour=discord.Colour.gold())
 
-    # Leader's total time for gap calculations
     leader_ms: int | None = None
     if places:
         raw = places[0].get("TotalRaceTime")
         if raw:
             leader_ms = _ns_to_ms(raw)
 
-    # --- Finishers ---
     lines = []
     overall_fastest_ms: int | None = None
     overall_fastest_driver = ""
@@ -210,23 +230,21 @@ def _build_result_embed(entry: dict, result: dict) -> discord.Embed:
 
         pos_str = _position_emoji(pos)
         car_str = f" *({car})*" if car else ""
-        dsq_str = " ~~DSQ~~" if dsq else ""
 
         if dsq:
             time_str = "DSQ"
         elif laps < leader_laps:
             laps_down = leader_laps - laps
-            lap_word = "lap" if laps_down == 1 else "laps"
-            time_str = f"+{laps_down} {lap_word}"
+            time_str = f"+{laps_down} {'lap' if laps_down == 1 else 'laps'}"
         elif leader_ms is not None and total_ms is not None and pos > 1:
-            gap = total_ms - leader_ms
-            time_str = _format_ms(gap, sign=True)
+            time_str = _format_ms(total_ms - leader_ms, sign=True)
         else:
             time_str = _format_ms(total_ms)
 
         if penalty_ms:
             time_str += f" (pen +{_format_ms(penalty_ms)})"
 
+        dsq_str = " ~~DSQ~~" if dsq else ""
         lines.append(f"{pos_str} **{name}**{car_str}{dsq_str} — {time_str}")
 
     if lines:
@@ -237,13 +255,46 @@ def _build_result_embed(entry: dict, result: dict) -> discord.Embed:
     footer_parts = []
     if overall_fastest_driver:
         footer_parts.append(f"Fastest lap: {overall_fastest_driver}  {_format_ms(overall_fastest_ms)}")
-
     champ_id = result.get("ChampionshipID") or ""
     if champ_id:
         footer_parts.append(f"Championship: {champ_id}")
-
     if footer_parts:
         embed.set_footer(text="  •  ".join(footer_parts))
+
+    return embed
+
+
+def _build_session_embed(client: AMS2Client, data: dict) -> discord.Embed:
+    attrs = data.get("attributes") or {}
+
+    def attr(key: str, default: str = "—") -> str:
+        v = attrs.get(key)
+        return str(v) if v is not None else default
+
+    session_state = attr("sessionState", "Unknown")
+    session_type = attr("sessionType", "Unknown")
+    track_id = str(data.get("trackId") or attrs.get("trackId") or attrs.get("track") or "")
+    track_name = client.resolve_track(track_id) if track_id else attr("trackName", "Unknown")
+
+    colour = {"Race": discord.Colour.red(), "Qualifying": discord.Colour.orange(),
+              "Practice": discord.Colour.green()}.get(session_type, discord.Colour.greyple())
+
+    embed = discord.Embed(
+        title=f"{session_type} — {track_name}",
+        description=f"State: **{session_state}**",
+        colour=colour,
+    )
+
+    members: list[dict] = data.get("members") or []
+    if members:
+        lines = []
+        for m in members:
+            name = m.get("name") or "Unknown"
+            state = m.get("state") or ""
+            lines.append(f"• **{name}**" + (f"  *{state}*" if state else ""))
+        embed.add_field(name=f"Drivers ({len(members)})", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="Drivers", value="No one connected", inline=False)
 
     return embed
 
@@ -253,10 +304,7 @@ def _build_standings_embed(championship_id: str, data: dict) -> discord.Embed:
         data.get("name") or data.get("Name")
         or data.get("championshipName") or f"Championship `{championship_id}`"
     )
-    embed = discord.Embed(
-        title=f"Standings — {name}",
-        colour=discord.Colour.blue(),
-    )
+    embed = discord.Embed(title=f"Standings — {name}", colour=discord.Colour.blue())
 
     drivers: list[dict] = data.get("drivers") or data.get("Drivers") or data.get("driverStandings") or []
 
@@ -274,9 +322,8 @@ def _build_standings_embed(championship_id: str, data: dict) -> discord.Embed:
             n = str(driver)
         return n or d.get("name") or d.get("Name") or "Unknown"
 
-    lines = []
-    for d in sorted(drivers, key=_pos)[:25]:
-        lines.append(f"{_position_emoji(_pos(d))} **{_name(d)}** — {_pts(d)} pts")
+    lines = [f"{_position_emoji(_pos(d))} **{_name(d)}** — {_pts(d)} pts"
+             for d in sorted(drivers, key=_pos)[:25]]
 
     if lines:
         embed.add_field(name="Drivers", value="\n".join(lines), inline=False)
@@ -285,11 +332,10 @@ def _build_standings_embed(championship_id: str, data: dict) -> discord.Embed:
 
     teams: list[dict] = data.get("teams") or data.get("Teams") or data.get("teamStandings") or []
     if teams:
-        team_lines = []
-        for i, t in enumerate(sorted(teams, key=_pos)[:10], 1):
-            tname = t.get("name") or t.get("Name") or t.get("team") or "Unknown"
-            pts = t.get("points") or t.get("Points") or 0
-            team_lines.append(f"`{i:>2}.` {tname} — {pts} pts")
+        team_lines = [
+            f"`{i:>2}.` {t.get('name') or t.get('Name') or 'Unknown'} — {t.get('points') or t.get('Points') or 0} pts"
+            for i, t in enumerate(sorted(teams, key=_pos)[:10], 1)
+        ]
         embed.add_field(name="Teams", value="\n".join(team_lines), inline=False)
 
     return embed
@@ -297,5 +343,6 @@ def _build_standings_embed(championship_id: str, data: dict) -> discord.Embed:
 
 async def setup(bot: commands.Bot):
     base_url = os.environ["AMS2SM_BASE_URL"]
-    client = AMS2Client(base_url)
+    game_server_url = os.environ.get("AMS2_GAME_SERVER_URL") or None
+    client = AMS2Client(base_url, game_server_url=game_server_url)
     await bot.add_cog(AMS2Cog(bot, client))
